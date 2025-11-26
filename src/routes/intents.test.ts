@@ -143,7 +143,7 @@ describe("intents quote route", () => {
 
   it("errors when config missing", async () => {
     config.intentsQuoteUrl = "";
-    OpenAPI.BASE = undefined;
+    OpenAPI.BASE = "";
     const res = await app.request("/api/intents/quote", {
       method: "POST",
       headers: { "Content-Type": "application/json" },

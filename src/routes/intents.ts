@@ -5,33 +5,17 @@ import { validateIntent } from "../queue/validation";
 import { setStatus } from "../state/status";
 import { config } from "../config";
 import { fetchWithRetry } from "../utils/http";
-import { SOL_NATIVE_MINT } from "../constants";
+import { SOL_NATIVE_MINT, extractSolanaMintAddress } from "../constants";
 import {
   OneClickService,
   OpenAPI,
+  QuoteRequest,
 } from "@defuse-protocol/one-click-sdk-typescript";
 
 const app = new Hono();
 const queueClient = new RedisQueueClient();
 
-interface QuoteRequest {
-  originAsset: string;
-  destinationAsset: string;
-  amount: string;
-  swapType: "EXACT_INPUT" | "EXACT_OUTPUT" | "FLEX_INPUT" | "ANY_INPUT";
-  slippageTolerance: number;
-  recipient: string;
-  recipientType: "DESTINATION_CHAIN" | "INTENTS";
-  refundTo: string;
-  refundType: "ORIGIN_CHAIN" | "INTENTS";
-  depositType: "ORIGIN_CHAIN" | "INTENTS";
-  deadline: string;
-  sessionId?: string;
-  referral?: string;
-  quoteWaitingTimeMs?: number;
-  dry?: boolean;
-  appFees?: { recipient: string; fee: number }[];
-}
+type QuoteRequestBody = QuoteRequest;
 
 interface IntentsQuoteResponse {
   timestamp?: string;
@@ -77,9 +61,9 @@ app.post("/quote", async (c) => {
     return c.json({ error: "INTENTS_QUOTE_URL is not configured" }, 500);
   }
 
-  let payload: QuoteRequest;
+  let payload: QuoteRequestBody;
   try {
-    payload = await c.req.json<QuoteRequest>();
+    payload = await c.req.json<QuoteRequestBody>();
   } catch {
     return c.json({ error: "Invalid JSON body" }, 400);
   }
@@ -91,10 +75,13 @@ app.post("/quote", async (c) => {
     );
   }
 
+  // Respect dry flag from request - dry: true for preview, dry: false for execution (to get depositAddress)
+  const isDryRun = payload.dry !== false;
+
   const solQuoteRequest = {
     ...payload,
     destinationAsset: `sol:${SOL_NATIVE_MINT}`,
-    dry: true,
+    dry: isDryRun,
   };
 
   if (config.intentsQuoteUrl) {
@@ -106,6 +93,7 @@ app.post("/quote", async (c) => {
     destinationAsset: payload.destinationAsset,
     amount: payload.amount,
     slippageTolerance: payload.slippageTolerance,
+    dry: isDryRun,
     intentsQuoteUrl: OpenAPI.BASE,
   });
 
@@ -128,10 +116,13 @@ app.post("/quote", async (c) => {
     return c.json({ error: "Intents quote missing amountOut" }, 502);
   }
 
+  // Extract raw Solana mint address from asset ID (handles 1cs_v1:sol:spl:mint format)
+  const outputMint = extractSolanaMintAddress(payload.destinationAsset);
+
   const clusterParam = config.jupiterCluster
     ? `&cluster=${config.jupiterCluster}`
     : "";
-  const jupiterUrl = `${config.jupiterBaseUrl}/quote?inputMint=${SOL_NATIVE_MINT}&outputMint=${encodeURIComponent(payload.destinationAsset)}&amount=${solAmount}&slippageBps=${payload.slippageTolerance}${clusterParam}`;
+  const jupiterUrl = `${config.jupiterBaseUrl}/quote?inputMint=${SOL_NATIVE_MINT}&outputMint=${encodeURIComponent(outputMint)}&amount=${solAmount}&slippageBps=${payload.slippageTolerance}${clusterParam}`;
   console.info("[intents/quote] requesting Jupiter leg", {
     url: jupiterUrl,
   });
@@ -159,18 +150,25 @@ app.post("/quote", async (c) => {
     return c.json({ error: "Jupiter quote missing outAmount" }, 502);
   }
 
+  // Generate a quote ID for tracking (use 1-Click quoteId if available, otherwise generate one)
+  const quoteId = baseQuote.quoteId || `shade-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
   return c.json({
     timestamp: intentsQuote.timestamp || new Date().toISOString(),
     signature: intentsQuote.signature || "",
     quoteRequest: {
       ...payload,
-      dry: true,
+      dry: isDryRun,
     },
     quote: {
       ...baseQuote,
+      quoteId,
       amountOut: outAmount,
       minAmountOut: outAmount,
       destinationAsset: payload.destinationAsset,
+      // Include depositAddress and depositMemo from 1-Click quote (only present when dry: false)
+      depositAddress: baseQuote.depositAddress,
+      depositMemo: baseQuote.depositMemo,
     },
   });
 });

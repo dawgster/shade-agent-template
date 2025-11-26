@@ -2,6 +2,7 @@ import { requestSignature } from "@neardefi/shade-agent-js";
 import { utils } from "chainsig.js";
 import { VersionedTransaction } from "@solana/web3.js";
 import { config } from "../config";
+import { extractSolanaMintAddress } from "../constants";
 import { ValidatedIntent } from "../queue/types";
 import {
   attachSignatureToVersionedTx,
@@ -38,10 +39,14 @@ export async function executeSolanaSwapFlow(
 async function buildJupiterSwapTransaction(
   intent: ValidatedIntent,
 ): Promise<{ transaction: VersionedTransaction; agentPublicKey: string }> {
-  const agentPublicKey = await deriveAgentPublicKey();
+  const agentPublicKey = await deriveAgentPublicKey(
+    SOLANA_DEFAULT_PATH,
+    intent.nearPublicKey,
+  );
 
-  const inputMint = intent.intermediateAsset || intent.sourceAsset; // asset delivered by first-leg swap (e.g. wrapped SOL)
-  const outputMint = intent.finalAsset; // SPL mint address for token X
+  // Extract raw Solana mint addresses from asset IDs (handles 1cs_v1:sol:spl:mint format)
+  const inputMint = extractSolanaMintAddress(intent.intermediateAsset || intent.sourceAsset); // asset delivered by first-leg swap (e.g. wrapped SOL)
+  const outputMint = extractSolanaMintAddress(intent.finalAsset); // SPL mint address for token X
   const amount = intent.destinationAmount || intent.sourceAmount; // amount available on destination chain for second leg
 
   const clusterParam = config.jupiterCluster

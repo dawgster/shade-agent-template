@@ -1,7 +1,15 @@
 import { setStatus } from "../state/status";
 import { RedisQueueClient } from "./redis";
-import { IntentMessage, ValidatedIntent } from "./types";
+import { ValidatedIntent } from "./types";
 import { executeSolanaSwapFlow } from "../flows/solSwap";
+import {
+  executeKaminoDepositFlow,
+  isKaminoDepositIntent,
+} from "../flows/kaminoDeposit";
+import {
+  executeKaminoWithdrawFlow,
+  isKaminoWithdrawIntent,
+} from "../flows/kaminoWithdraw";
 import { validateIntent } from "./validation";
 import { config } from "../config";
 
@@ -50,7 +58,7 @@ async function processIntentWithRetry(
         detail: `attempt ${attempt}/${config.maxIntentAttempts}`,
       });
 
-      const result = await executeSolanaSwapFlow(intent);
+      const result = await executeIntentFlow(intent);
       await setStatus(intent.intentId, {
         state: "succeeded",
         txId: result.txId,
@@ -81,4 +89,22 @@ async function processIntentWithRetry(
 
 function delay(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Routes the intent to the appropriate execution flow based on metadata
+ */
+async function executeIntentFlow(
+  intent: ValidatedIntent,
+): Promise<{ txId: string }> {
+  if (isKaminoDepositIntent(intent)) {
+    return executeKaminoDepositFlow(intent);
+  }
+
+  if (isKaminoWithdrawIntent(intent)) {
+    return executeKaminoWithdrawFlow(intent);
+  }
+
+  // Default to Solana swap flow
+  return executeSolanaSwapFlow(intent);
 }

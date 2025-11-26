@@ -22,13 +22,18 @@ export function getSolanaConnection() {
   return solanaConnection;
 }
 
-export async function deriveAgentPublicKey(path = SOLANA_DEFAULT_PATH) {
+export async function deriveAgentPublicKey(
+  path = SOLANA_DEFAULT_PATH,
+  nearPublicKey?: string,
+) {
   const accountId = config.shadeContractId;
   if (!accountId) throw new Error("NEXT_PUBLIC_contractId not configured");
 
+  const derivationPath = nearPublicKey ? `${path},${nearPublicKey}` : path;
+
   const { publicKey } = await SolanaAdapter.deriveAddressAndPublicKey(
     accountId,
-    path,
+    derivationPath,
   );
   return new PublicKey(publicKey as string);
 }
