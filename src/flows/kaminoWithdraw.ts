@@ -300,13 +300,22 @@ async function executeBridgeBack(
       ? getSolDefuseAssetId()
       : getDefuseAssetId("solana", mintAddress) || `nep141:${mintAddress}.omft.near`;
 
+  // Create deadline 30 minutes from now
+  const deadline = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+
   const quoteRequest = {
     originAsset,
     destinationAsset, // Caller provides this in Defuse format
-    amount: withdrawnAmount,
+    amount: String(withdrawnAmount),
+    swapType: "EXACT_INPUT" as const,
     slippageTolerance: slippageTolerance ?? 300, // Default 3%
     dry: false, // Important: we need the deposit address
     recipient: destinationAddress,
+    recipientType: "DESTINATION_CHAIN" as const,
+    refundTo: intent.nearPublicKey || intent.userDestination,
+    refundType: "ORIGIN_CHAIN" as const,
+    depositType: "ORIGIN_CHAIN" as const,
+    deadline,
   };
 
   console.log("[kaminoWithdraw] Requesting intents quote", quoteRequest);

@@ -242,13 +242,22 @@ async function executeIntentsSwap(
   // The origin asset should be provided by the caller in Defuse format
   const originAsset = intent.sourceAsset;
 
+  // Create deadline 30 minutes from now
+  const deadline = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+
   const quoteRequest = {
     originAsset,
     destinationAsset,
-    amount: intent.sourceAmount,
+    amount: String(intent.sourceAmount),
+    swapType: "EXACT_INPUT" as const,
     slippageTolerance: meta.slippageTolerance ?? 300, // Default 3%
     dry: false, // We need the deposit address
     recipient: agentSolanaAddress,
+    recipientType: "DESTINATION_CHAIN" as const,
+    refundTo: intent.nearPublicKey || intent.userDestination,
+    refundType: "ORIGIN_CHAIN" as const,
+    depositType: "ORIGIN_CHAIN" as const,
+    deadline,
   };
 
   console.log("[kaminoDeposit] Requesting intents quote", quoteRequest);
