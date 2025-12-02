@@ -55,6 +55,12 @@ export interface IntentMessage {
   originTxHash?: string;
   sessionId?: string;
   metadata?: IntentMetadata;
+  /** NEAR public key for Kamino operations (derives Solana address) */
+  nearPublicKey?: string;
+  /** User's address on the source chain for refunds */
+  refundAddress?: string;
+  /** User signature proving authorization for this intent (required for withdrawals) */
+  userSignature?: UserSignature;
 }
 
 export interface UserSignature {
@@ -72,9 +78,4 @@ export interface UserSignature {
 
 export interface ValidatedIntent extends IntentMessage {
   slippageBps: number;
-  nearPublicKey?: string;
-  /** User's address on the source chain for refunds */
-  refundAddress?: string;
-  /** User signature proving authorization for this intent */
-  userSignature?: UserSignature;
 }
