@@ -237,6 +237,9 @@ describe("integration: API routes", () => {
       destinationAmount: "1000",
       userDestination: "4cJgUe8TKEkJtqWSXoe4fAhN74LW2TbK4DGVkfdxUJZk",
       agentDestination: "8CKsW6cVfaQnBxpqtKfxDxZ8sM3E7DbpDZEPXx1cBa9u",
+      // Required verification proof (deposit-verified)
+      originTxHash: "test-tx-hash-12345",
+      intentsDepositAddress: "deposit-addr-12345",
     };
 
     const postRes = await app.request("/api/intents", {

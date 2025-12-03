@@ -43,6 +43,9 @@ const baseIntent = {
   destinationAmount: "1000",
   userDestination: "4cJgUe8TKEkJtqWSXoe4fAhN74LW2TbK4DGVkfdxUJZk",
   agentDestination: "8CKsW6cVfaQnBxpqtKfxDxZ8sM3E7DbpDZEPXx1cBa9u",
+  // Required verification proof (deposit-verified)
+  originTxHash: "test-tx-hash-12345",
+  intentsDepositAddress: "deposit-addr-12345",
 };
 
 describe("intents route", () => {
@@ -52,7 +55,7 @@ describe("intents route", () => {
     config.enableQueue = true;
   });
 
-  it("accepts a valid intent and enqueues", async () => {
+  it("accepts a valid intent with deposit proof and enqueues", async () => {
     const res = await app.request("/api/intents", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -67,7 +70,26 @@ describe("intents route", () => {
     expect(setStatusMock).toHaveBeenCalledWith("abc", { state: "pending" });
   });
 
-  it("returns 400 on validation error", async () => {
+  it("returns 403 when verification proof is missing", async () => {
+    const intentWithoutProof = {
+      ...baseIntent,
+      originTxHash: undefined,
+      intentsDepositAddress: undefined,
+    };
+
+    const res = await app.request("/api/intents", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(intentWithoutProof),
+    });
+
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body.error).toContain("verification");
+    expect(enqueueIntentMock).not.toHaveBeenCalled();
+  });
+
+  it("returns 400 on validation error (with valid proof)", async () => {
     const res = await app.request("/api/intents", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
