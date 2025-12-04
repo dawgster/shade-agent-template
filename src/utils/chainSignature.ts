@@ -21,16 +21,25 @@ const chainSignatureContract = new contracts.ChainSignatureContract({
  *
  * @param path - Derivation path (default: "near-1")
  * @param nearPublicKey - Optional NEAR public key to include in derivation
+ * @param userDestination - Optional user destination address for custody isolation
  * @returns The derived NEAR implicit account ID and public key in ed25519:... format
  */
 export async function deriveNearImplicitAccount(
   path = NEAR_DEFAULT_PATH,
   nearPublicKey?: string,
+  userDestination?: string,
 ): Promise<{ accountId: string; publicKey: string }> {
   const accountId = config.shadeContractId;
   if (!accountId) throw new Error("NEXT_PUBLIC_contractId not configured");
 
-  const derivationPath = nearPublicKey ? `${path},${nearPublicKey}` : path;
+  // Build derivation path including user identifiers for custody isolation
+  let derivationPath = path;
+  if (nearPublicKey) {
+    derivationPath = `${derivationPath},${nearPublicKey}`;
+  }
+  if (userDestination) {
+    derivationPath = `${derivationPath},${userDestination}`;
+  }
 
   // Derive the ed25519 public key from the MPC
   const derivedKey = await chainSignatureContract.getDerivedPublicKey({
@@ -97,24 +106,19 @@ function base58Decode(str: string): Uint8Array {
 /**
  * Signs a payload using NEAR chain signatures (EdDSA for Solana).
  * @param payloadBytes - The serialized transaction message to sign
- * @param nearPublicKey - Optional NEAR public key to include in derivation path
  * @param userDestination - Optional user destination address for custody isolation
  * @returns The signature as Uint8Array
  */
 export async function signWithNearChainSignatures(
   payloadBytes: Uint8Array,
-  nearPublicKey?: string,
   userDestination?: string,
 ): Promise<Uint8Array> {
   if (!config.shadeContractId) {
     throw new Error("NEXT_PUBLIC_contractId not configured for signing");
   }
 
-  // Build derivation path including user identifiers for custody isolation
+  // Build derivation path including user destination for custody isolation
   let derivationPath = SOLANA_DEFAULT_PATH;
-  if (nearPublicKey) {
-    derivationPath = `${derivationPath},${nearPublicKey}`;
-  }
   if (userDestination) {
     derivationPath = `${derivationPath},${userDestination}`;
   }

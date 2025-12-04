@@ -1,13 +1,16 @@
 import {
-  VersionedTransaction,
-  Connection,
-  TransactionMessage,
-  PublicKey,
-} from "@solana/web3.js";
-import {
   createSolanaRpc,
   address,
+  pipe,
+  createTransactionMessage,
+  appendTransactionMessageInstructions,
+  setTransactionMessageFeePayerSigner,
+  setTransactionMessageLifetimeUsingBlockhash,
+  compileTransaction,
+  Address,
+  IInstruction,
 } from "@solana/kit";
+import { getTransferSolInstruction } from "@solana-program/system";
 import {
   KaminoAction,
   KaminoMarket,
@@ -18,8 +21,6 @@ import BN from "bn.js";
 import { config } from "../config";
 import { KaminoDepositMetadata, ValidatedIntent } from "../queue/types";
 import {
-  attachSignatureToVersionedTx,
-  broadcastSolanaTx,
   deriveAgentPublicKey,
   SOLANA_DEFAULT_PATH,
 } from "../utils/solana";
@@ -27,23 +28,6 @@ import {
   signWithNearChainSignatures,
   createDummySigner,
 } from "../utils/chainSignature";
-import {
-  createIntentSigningMessage,
-  validateIntentSignature,
-} from "../utils/nearSignature";
-import {
-  OneClickService,
-  OpenAPI,
-} from "@defuse-protocol/one-click-sdk-typescript";
-import { getDefuseAssetId, getSolDefuseAssetId } from "../utils/tokenMappings";
-import { SOL_NATIVE_MINT } from "../constants";
-import { getTokenBalance, waitForTokenBalance } from "../utils/solanaBalance";
-import { setStatus } from "../state/status";
-
-// How long to wait for intents to deliver tokens (15 minutes)
-const INTENTS_TIMEOUT_MS = 15 * 60 * 1000;
-// How often to poll for token balance
-const BALANCE_POLL_INTERVAL_MS = 10_000;
 
 interface KaminoDepositResult {
   txId: string;
@@ -65,33 +49,19 @@ function createKaminoRpc() {
 }
 
 /**
- * Verifies that the intent has a valid user signature authorizing the action
- * Throws an error if authorization fails
+ * Verifies that the intent has valid authorization
+ * For deposits, the authorization is the deposit transaction itself
+ * (the user sending funds to the intents deposit address)
  */
 function verifyUserAuthorization(intent: ValidatedIntent): void {
-  // Require nearPublicKey for Kamino deposits
-  if (!intent.nearPublicKey) {
-    throw new Error("Kamino deposit requires nearPublicKey to identify the user");
+  // Require userDestination for Kamino deposits
+  if (!intent.userDestination) {
+    throw new Error("Kamino deposit requires userDestination to identify the user");
   }
 
-  // Require user signature
-  if (!intent.userSignature) {
-    throw new Error("Kamino deposit requires userSignature for authorization");
-  }
-
-  // Generate the expected message hash for this intent
-  const expectedMessage = createIntentSigningMessage(intent);
-
-  // Validate the signature
-  const result = validateIntentSignature(
-    intent.userSignature,
-    intent.nearPublicKey,
-    expectedMessage,
-  );
-
-  if (!result.isValid) {
-    throw new Error(`Authorization failed: ${result.error}`);
-  }
+  // For deposits, authorization is implicit via the deposit transaction
+  // The user proves ownership by sending funds from their wallet
+  // No additional signature verification needed
 }
 
 export async function executeKaminoDepositFlow(
@@ -114,203 +84,138 @@ export async function executeKaminoDepositFlow(
   // Get the agent's Solana address with userDestination in path for custody isolation
   const agentPublicKey = await deriveAgentPublicKey(
     SOLANA_DEFAULT_PATH,
-    intent.nearPublicKey,
     intent.userDestination,
   );
   const agentSolanaAddress = agentPublicKey.toBase58();
 
-  let depositAmount = intent.sourceAmount;
-  let intentsDepositAddress: string | undefined;
-  let depositMemo: string | undefined;
+  // Use intermediateAmount if available (set by quote route after intents swap)
+  // Otherwise fall back to sourceAmount for direct deposits
+  let depositAmount = intent.intermediateAmount || intent.sourceAmount;
 
-  if (meta.useIntents) {
-    console.log(`[kaminoDeposit] Using Intents to swap ${intent.sourceAsset} to pool target asset`);
-
-    // Step 1: Get the intents quote and deposit address
-    const intentsResult = await executeIntentsSwap(intent, meta);
-    intentsDepositAddress = intentsResult.depositAddress;
-    depositMemo = intentsResult.depositMemo;
-    const expectedAmount = BigInt(intentsResult.expectedAmount);
-
-    console.log(`[kaminoDeposit] Got intents deposit address: ${intentsDepositAddress}`);
-    console.log(`[kaminoDeposit] Expected amount after swap: ${expectedAmount}`);
-
-    // Step 2: Update status to awaiting_deposit so the user knows where to send funds
-    await setStatus(intent.intentId, {
-      state: "awaiting_deposit",
-      depositAddress: intentsDepositAddress,
-      depositMemo,
-      expectedAmount: intentsResult.expectedAmount,
-    });
-
-    // Step 3: Get the current balance before the swap
-    const balanceBefore = await getTokenBalance(agentSolanaAddress, meta.mintAddress);
-    console.log(`[kaminoDeposit] Balance before: ${balanceBefore}`);
-
-    // Step 4: Wait for intents to deliver the tokens
-    // The user deposits to the intents address, intents swaps and delivers to agent's Solana address
-    await setStatus(intent.intentId, {
-      state: "awaiting_intents",
-      detail: "Waiting for cross-chain swap to complete",
-    });
-
-    console.log(`[kaminoDeposit] Waiting for tokens to arrive at ${agentSolanaAddress}...`);
-
-    // Wait for balance to increase by at least the expected amount (with some tolerance for slippage)
-    // Use the user's slippage tolerance from metadata, default to 3% (300 bps)
-    const slippageBps = meta.slippageTolerance ?? 300;
-    const slippageMultiplier = BigInt(10000 - slippageBps);
-    const minExpectedBalance = balanceBefore + (expectedAmount * slippageMultiplier) / BigInt(10000);
-
-    const actualBalance = await waitForTokenBalance(
-      agentSolanaAddress,
-      meta.mintAddress,
-      minExpectedBalance,
-      INTENTS_TIMEOUT_MS,
-      BALANCE_POLL_INTERVAL_MS,
-    );
-
-    // Calculate the actual received amount
-    const receivedAmount = actualBalance - balanceBefore;
-    depositAmount = receivedAmount.toString();
-
-    console.log(`[kaminoDeposit] Tokens received! Amount: ${receivedAmount}`);
-
-    // Step 5: Update status to processing for the Kamino deposit
-    await setStatus(intent.intentId, {
-      state: "processing",
-      detail: "Executing Kamino deposit",
-    });
-  }
+  console.log(`[kaminoDeposit] Executing Kamino deposit for amount: ${depositAmount}`);
 
   // Execute the Kamino deposit with the received tokens
   console.log(`[kaminoDeposit] Building Kamino deposit transaction for amount: ${depositAmount}`);
 
-  const { transaction, serializedMessage } = await buildKaminoDepositTransaction(
+  const { compiledTx, serializedMessage, feePayerAddress, userAgentAddress } = await buildKaminoDepositTransaction(
     intent,
     depositAmount,
   );
-  // Sign with derivation path that includes userDestination for custody isolation
-  const signature = await signWithNearChainSignatures(
+
+  // Transaction requires two signatures:
+  // 1. Base agent (fee payer) - pays for gas
+  // 2. User-specific derived account (token owner) - holds USDC/tokens
+
+  // Sign with base agent (fee payer)
+  const feePayerSignature = await signWithNearChainSignatures(
     serializedMessage,
-    intent.nearPublicKey,
+    undefined, // base agent path
+  );
+
+  // Sign with user-specific derived account (token owner)
+  const userAgentSignature = await signWithNearChainSignatures(
+    serializedMessage,
     intent.userDestination,
   );
-  const finalized = attachSignatureToVersionedTx(transaction, signature);
-  const txId = await broadcastSolanaTx(finalized);
+
+  // Add signatures to the compiled transaction
+  const signedTx = {
+    ...compiledTx,
+    signatures: {
+      ...compiledTx.signatures,
+      [feePayerAddress]: feePayerSignature,
+      [userAgentAddress]: userAgentSignature,
+    },
+  };
+
+  // Send the transaction using @solana/kit
+  const rpc = createKaminoRpc();
+  const txId = await sendSignedTransaction(rpc, signedTx);
 
   console.log(`[kaminoDeposit] Kamino deposit confirmed: ${txId}`);
 
   return {
     txId,
-    intentsDepositAddress,
+    intentsDepositAddress: intent.intentsDepositAddress,
     swappedAmount: depositAmount,
   };
 }
 
-interface IntentsSwapResult {
-  depositAddress: string;
-  depositMemo?: string;
-  expectedAmount: string;
+interface CompiledTransaction {
+  messageBytes: Uint8Array;
+  signatures: Record<Address, Uint8Array>;
+}
+
+interface BuildTxResult {
+  compiledTx: CompiledTransaction;
+  serializedMessage: Uint8Array;
+  feePayerAddress: Address;
+  userAgentAddress: Address;
 }
 
 /**
- * Executes the Intents swap to convert the source asset to the Kamino pool's target asset.
- * Returns the deposit address where the user should send their funds.
+ * Send a signed transaction to the Solana network.
+ * Handles serialization in the Solana wire format.
  */
-async function executeIntentsSwap(
-  intent: ValidatedIntent,
-  meta: KaminoDepositMetadata,
-): Promise<IntentsSwapResult> {
-  if (config.intentsQuoteUrl) {
-    OpenAPI.BASE = config.intentsQuoteUrl;
+async function sendSignedTransaction(
+  rpc: ReturnType<typeof createSolanaRpc>,
+  signedTx: CompiledTransaction,
+): Promise<string> {
+  // Serialize to wire format: [num_signatures (1 byte)] + [signatures (64 bytes each)] + [message]
+  const signatureAddresses = Object.keys(signedTx.signatures) as Address[];
+  const numSignatures = signatureAddresses.length;
+  const totalSignatureBytes = numSignatures * 64;
+  const serialized = new Uint8Array(1 + totalSignatureBytes + signedTx.messageBytes.length);
+
+  serialized[0] = numSignatures;
+  let offset = 1;
+  for (const addr of signatureAddresses) {
+    serialized.set(signedTx.signatures[addr], offset);
+    offset += 64;
+  }
+  serialized.set(signedTx.messageBytes, offset);
+
+  // Send via RPC
+  const base64Tx = Buffer.from(serialized).toString("base64");
+  const signature = await rpc.sendTransaction(base64Tx as any, {
+    encoding: "base64",
+    skipPreflight: false,
+    preflightCommitment: "confirmed",
+  }).send();
+
+  // Wait for confirmation
+  const { value: statuses } = await rpc.getSignatureStatuses([signature]).send();
+  if (statuses[0]?.err) {
+    throw new Error(`Transaction failed: ${JSON.stringify(statuses[0].err)}`);
   }
 
-  // Get the agent's Solana address where intents will deliver the swapped tokens
-  // Include userDestination in path for custody isolation
-  const agentPublicKey = await deriveAgentPublicKey(
-    SOLANA_DEFAULT_PATH,
-    intent.nearPublicKey,
-    intent.userDestination,
-  );
-  const agentSolanaAddress = agentPublicKey.toBase58();
-
-  // Use the Defuse asset ID from metadata, or fall back to lookup
-  const destinationAsset = meta.targetDefuseAssetId
-    || (meta.mintAddress === SOL_NATIVE_MINT
-      ? getSolDefuseAssetId()
-      : getDefuseAssetId("solana", meta.mintAddress));
-
-  if (!destinationAsset) {
-    throw new Error(`Cannot determine Defuse asset ID for mint: ${meta.mintAddress}. Please provide targetDefuseAssetId in metadata.`);
-  }
-
-  // The origin asset should be provided by the caller in Defuse format
-  const originAsset = intent.sourceAsset;
-
-  // Create deadline 30 minutes from now
-  const deadline = new Date(Date.now() + 30 * 60 * 1000).toISOString();
-
-  const quoteRequest = {
-    originAsset,
-    destinationAsset,
-    amount: String(intent.sourceAmount),
-    swapType: "EXACT_INPUT" as const,
-    slippageTolerance: meta.slippageTolerance ?? 300, // Default 3%
-    dry: false, // We need the deposit address
-    recipient: agentSolanaAddress,
-    recipientType: "DESTINATION_CHAIN" as const,
-    refundTo: intent.refundAddress || intent.userDestination,
-    refundType: "ORIGIN_CHAIN" as const,
-    depositType: "ORIGIN_CHAIN" as const,
-    deadline,
-  };
-
-  console.log("[kaminoDeposit] Requesting intents quote", quoteRequest);
-
-  const quoteResponse = await OneClickService.getQuote(quoteRequest as any);
-  const quote = quoteResponse as any;
-
-  console.log("[kaminoDeposit] Intents quote response", quote);
-
-  // The response may have depositAddress at the top level or nested in quote.quote
-  const innerQuote = quote.quote || quote;
-  const depositAddress = innerQuote.depositAddress || quote.depositAddress;
-  if (!depositAddress) {
-    throw new Error("Intents quote response missing depositAddress");
-  }
-
-  const depositMemo = innerQuote.depositMemo || quote.depositMemo;
-  const expectedAmount =
-    innerQuote.amountOut || innerQuote.minAmountOut || quote.amountOut || quote.minAmountOut || intent.sourceAmount;
-
-  console.log(`[kaminoDeposit] Got intents deposit address: ${depositAddress}, memo: ${depositMemo}, expected: ${expectedAmount}`);
-
-  return {
-    depositAddress,
-    depositMemo,
-    expectedAmount: String(expectedAmount),
-  };
+  return signature;
 }
 
 async function buildKaminoDepositTransaction(
   intent: ValidatedIntent,
   depositAmount: string,
-): Promise<{ transaction: VersionedTransaction; serializedMessage: Uint8Array }> {
+): Promise<BuildTxResult> {
   const rpc = createKaminoRpc();
   const meta = intent.metadata as KaminoDepositMetadata;
 
-  // Include userDestination in path for custody isolation
-  const agentPublicKey = await deriveAgentPublicKey(
+  // Base agent pays for transaction fees (has SOL)
+  const feePayerPublicKey = await deriveAgentPublicKey(SOLANA_DEFAULT_PATH);
+  const feePayerAddress = address(feePayerPublicKey.toBase58());
+
+  // User-specific derived account holds tokens for custody isolation
+  const userAgentPublicKey = await deriveAgentPublicKey(
     SOLANA_DEFAULT_PATH,
-    intent.nearPublicKey,
     intent.userDestination,
   );
-  const ownerAddress = address(agentPublicKey.toBase58());
+  const userAgentAddress = address(userAgentPublicKey.toBase58());
 
-  // Create a dummy signer - we only need its address, not actual signing capability
-  // The actual signing is done via NEAR chain signatures
-  const dummySigner = await createDummySigner(ownerAddress);
+  // Create a dummy signer for the fee payer - the Kamino SDK needs a signer object
+  // but we'll sign externally via NEAR chain signatures
+  const feePayerSigner = createDummySigner(feePayerAddress);
+
+  // Create a dummy signer for the token owner (user agent)
+  const userAgentSigner = createDummySigner(userAgentAddress);
 
   const market = await KaminoMarket.load(
     rpc,
@@ -333,45 +238,85 @@ async function buildKaminoDepositTransaction(
     market,
     amount,
     reserve.getLiquidityMint(),
-    dummySigner,
+    userAgentSigner,  // The signer that owns the tokens
     new VanillaObligation(PROGRAM_ID),
-    false,
-    undefined,
-    300_000,
-    true,
+    false,  // useV2Ixs
+    undefined,  // scopeRefreshConfig
+    300_000,  // extraComputeBudget
+    true,  // includeAtaIxs
+    false,  // requestElevationGroup
+    { skipInitialization: false, skipLutCreation: true },  // Skip LUT but allow user metadata init
   );
 
-  const instructions = [
-    ...depositAction.computeBudgetIxs,
-    ...depositAction.setupIxs,
-    ...depositAction.lendingIxs,
-    ...depositAction.cleanupIxs,
-  ];
+  // User agent needs SOL for rent:
+  // - User metadata: ~0.008 SOL
+  // - Obligation: ~0.024 SOL
+  // - Farms user account: ~0.0073 SOL
+  // - Buffer for other accounts: ~0.005 SOL
+  // Check current balance and only transfer what's needed
+  const MIN_RENT_LAMPORTS = 45_000_000n; // 0.045 SOL minimum needed for rent
+  const { value: userAgentBalance } = await rpc.getBalance(userAgentAddress).send();
 
-  // For broadcasting via @solana/web3.js, we need to convert the transaction
-  const connection = new Connection(config.solRpcUrl, "confirmed");
-  const { blockhash } = await connection.getLatestBlockhash();
+  const kaminoInstructions = [
+    ...(depositAction.computeBudgetIxs || []),
+    ...(depositAction.setupIxs || []),
+    ...(depositAction.lendingIxs || []),
+    ...(depositAction.cleanupIxs || []),
+  ].filter((ix) => ix != null);
 
-  // Convert kit instructions to web3.js instructions
-  // AccountRole values from @solana/instructions:
-  // READONLY = 0, WRITABLE = 1, READONLY_SIGNER = 2, WRITABLE_SIGNER = 3
-  const web3Instructions = instructions.map((ix: any) => ({
-    programId: new PublicKey(ix.programAddress),
-    keys: ix.accounts.map((acc: any) => ({
-      pubkey: new PublicKey(acc.address),
-      isSigner: acc.role === 2 || acc.role === 3, // READONLY_SIGNER or WRITABLE_SIGNER
-      isWritable: acc.role === 1 || acc.role === 3, // WRITABLE or WRITABLE_SIGNER
-    })),
-    data: Buffer.from(ix.data),
-  }));
+  const instructions: IInstruction[] = [];
 
-  const messageV0 = new TransactionMessage({
-    payerKey: agentPublicKey,
-    recentBlockhash: blockhash,
-    instructions: web3Instructions,
-  }).compileToV0Message();
+  // Only add transfer if user agent needs more SOL
+  if (userAgentBalance < MIN_RENT_LAMPORTS) {
+    const amountNeeded = MIN_RENT_LAMPORTS - userAgentBalance;
+    console.log(`[kaminoDeposit] User agent has ${userAgentBalance} lamports, needs ${MIN_RENT_LAMPORTS}, transferring ${amountNeeded}`);
 
-  const transaction = new VersionedTransaction(messageV0);
+    const fundUserAgentIx = getTransferSolInstruction({
+      source: feePayerSigner,
+      destination: userAgentAddress,
+      amount: amountNeeded,
+    });
+    instructions.push(fundUserAgentIx);
+  } else {
+    console.log(`[kaminoDeposit] User agent has sufficient SOL: ${userAgentBalance} lamports`);
+  }
 
-  return { transaction, serializedMessage: transaction.message.serialize() };
+  instructions.push(...kaminoInstructions);
+
+  console.log(`[kaminoDeposit] Got ${instructions.length} instructions from Kamino SDK`);
+
+  // Fetch blockhash for transaction lifetime
+  const { value: blockhash } = await rpc.getLatestBlockhash().send();
+
+  // Build transaction message using @solana/kit pipe pattern
+  const txMessage = pipe(
+    createTransactionMessage({ version: 0 }),
+    (tx) => appendTransactionMessageInstructions(instructions, tx),
+    (tx) => setTransactionMessageFeePayerSigner(feePayerSigner, tx),
+    (tx) => setTransactionMessageLifetimeUsingBlockhash(blockhash, tx),
+  );
+
+  // Compile the transaction (without signing - we'll sign externally)
+  const rawCompiledTx = compileTransaction(txMessage);
+
+  // Convert to our simplified type (avoiding @solana/kit nominal types)
+  // Filter out null signatures and convert to Uint8Array
+  const compiledTx: CompiledTransaction = {
+    messageBytes: new Uint8Array(rawCompiledTx.messageBytes),
+    signatures: Object.fromEntries(
+      Object.entries(rawCompiledTx.signatures)
+        .filter(([, v]) => v !== null)
+        .map(([k, v]) => [k, new Uint8Array(v!)])
+    ) as Record<Address, Uint8Array>,
+  };
+
+  // The message bytes are what we need to sign
+  const serializedMessage = compiledTx.messageBytes;
+
+  return {
+    compiledTx,
+    serializedMessage,
+    feePayerAddress,
+    userAgentAddress,
+  };
 }

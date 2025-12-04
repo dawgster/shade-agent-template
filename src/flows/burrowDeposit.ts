@@ -9,24 +9,11 @@ import {
   validateIntentSignature,
 } from "../utils/nearSignature";
 import {
-  serializeTransaction,
-  getAccessKeyInfo,
-  broadcastTransaction,
-  createSignedTransaction,
-  NearAction,
-} from "../utils/nearTransaction";
-import {
-  deriveNearImplicitAccount,
-  NEAR_DEFAULT_PATH,
-} from "../utils/chainSignature";
-import { requestSignature } from "@neardefi/shade-agent-js";
-import { utils } from "chainsig.js";
-
-const { uint8ArrayToHex } = utils.cryptography;
-
-// Gas amounts (in yoctoNEAR)
-const GAS_FOR_FT_TRANSFER_CALL = "100000000000000"; // 100 TGas
-const ONE_YOCTO = "1";
+  executeMetaTransaction,
+  createFunctionCallAction,
+  GAS_FOR_FT_TRANSFER_CALL,
+  ONE_YOCTO,
+} from "../utils/nearMetaTx";
 
 interface BurrowDepositResult {
   txId: string;
@@ -79,23 +66,12 @@ export async function executeBurrowDepositFlow(
     return result;
   }
 
-  // Derive the NEAR implicit account from the user's public key
-  // This ensures the user retains ownership of their assets
-  const { accountId: nearAccountId, publicKey: derivedPublicKey } = await deriveNearImplicitAccount(
-    NEAR_DEFAULT_PATH,
-    intent.nearPublicKey,
-  );
-
-  console.log(`[burrowDeposit] Using derived NEAR account: ${nearAccountId}`);
+  if (!intent.userDestination) {
+    throw new Error("Burrow deposit requires userDestination for custody isolation");
+  }
 
   let depositAmount = intent.sourceAmount;
   let intentsDepositAddress: string | undefined;
-
-  // TODO: Implement intents cross-chain swap if meta.useIntents is true
-  // Similar to Kamino, we would:
-  // 1. Get intents quote for swapping source asset to NEAR token
-  // 2. Wait for the swap to complete
-  // 3. Use the received amount for the deposit
 
   // Verify the token can be deposited
   const assets = await getAssetsPagedDetailed();
@@ -122,50 +98,20 @@ export async function executeBurrowDepositFlow(
 
   console.log(`[burrowDeposit] Built supply tx via Rhea SDK: ${supplyTx.method_name} on ${supplyTx.contract_id}`);
 
-  const actions: NearAction[] = [
-    {
-      type: "FunctionCall",
-      methodName: supplyTx.method_name,
-      args: JSON.stringify(supplyTx.args),
-      gas: GAS_FOR_FT_TRANSFER_CALL,
-      deposit: ONE_YOCTO,
-    },
-  ];
+  // Create action for meta transaction
+  const action = createFunctionCallAction(
+    supplyTx.method_name,
+    supplyTx.args,
+    GAS_FOR_FT_TRANSFER_CALL,
+    ONE_YOCTO,
+  );
 
-  // Get access key info for the derived account
-  const accessKeyInfo = await getAccessKeyInfo(nearAccountId, derivedPublicKey);
-
-  // Serialize the transaction using derived account and public key
-  const serializedTx = serializeTransaction({
-    signerId: nearAccountId,
-    publicKey: derivedPublicKey,
-    nonce: accessKeyInfo.nonce + 1,
-    receiverId: supplyTx.contract_id, // Token contract from SDK response
-    blockHash: accessKeyInfo.block_hash,
-    actions,
-  });
-
-  // Sign the transaction using NEAR chain signatures
-  // Use the same derivation path that was used to derive the account
-  const derivationPath = `${NEAR_DEFAULT_PATH},${intent.nearPublicKey}`;
-  const signRes = await requestSignature({
-    path: derivationPath,
-    payload: uint8ArrayToHex(serializedTx),
-    keyType: "Eddsa",
-  });
-
-  if (!signRes.signature) {
-    throw new Error("Failed to get signature from chain signatures");
-  }
-
-  // Parse the signature
-  const signature = parseSignatureResponse(signRes.signature);
-
-  // Create signed transaction
-  const signedTxBase64 = createSignedTransaction(serializedTx, signature);
-
-  // Broadcast the transaction
-  const { txHash } = await broadcastTransaction(signedTxBase64);
+  // Execute via meta transaction - agent pays for gas
+  const txHash = await executeMetaTransaction(
+    intent.userDestination,
+    supplyTx.contract_id,
+    [action],
+  );
 
   console.log(`[burrowDeposit] Deposit tx confirmed: ${txHash}`);
 
@@ -174,27 +120,4 @@ export async function executeBurrowDepositFlow(
     intentsDepositAddress,
     swappedAmount: depositAmount,
   };
-}
-
-function parseSignatureResponse(sigResponse: string | { r: string; s: string }): Uint8Array {
-  if (typeof sigResponse === "string") {
-    // Hex or base64 encoded
-    if (sigResponse.startsWith("0x")) {
-      return Buffer.from(sigResponse.slice(2), "hex");
-    }
-    // Try hex first, then base64
-    try {
-      const hexBytes = Buffer.from(sigResponse, "hex");
-      if (hexBytes.length === 64) return hexBytes;
-    } catch {}
-    return Buffer.from(sigResponse, "base64");
-  }
-
-  // r + s format
-  const r = Buffer.from(sigResponse.r, "hex");
-  const s = Buffer.from(sigResponse.s, "hex");
-  const signature = new Uint8Array(64);
-  signature.set(r, 0);
-  signature.set(s, 32);
-  return signature;
 }

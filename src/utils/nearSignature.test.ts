@@ -8,7 +8,7 @@ import {
   createIntentSigningMessage,
   validateIntentSignature,
 } from "./nearSignature";
-import { UserSignature } from "../queue/types";
+import { NearUserSignature, LegacyUserSignature } from "../queue/types";
 
 // Generate a test keypair
 const testKeypair = nacl.sign.keyPair();
@@ -111,9 +111,9 @@ function signMessageNEP413(
 }
 
 /**
- * Creates a full UserSignature for testing
+ * Creates a full LegacyUserSignature for testing (NEAR NEP-413 format)
  */
-function createTestUserSignature(message: string): UserSignature {
+function createTestUserSignature(message: string): LegacyUserSignature {
   const nonce = new Uint8Array(32);
   crypto.getRandomValues(nonce);
 
@@ -313,29 +313,29 @@ describe("nearSignature", () => {
     });
 
     it("rejects missing nonce", () => {
-      const userSignature = createTestUserSignature("test") as Partial<UserSignature>;
+      const userSignature = createTestUserSignature("test") as Partial<LegacyUserSignature>;
       delete userSignature.nonce;
 
       const result = validateIntentSignature(
-        userSignature as UserSignature,
+        userSignature as LegacyUserSignature,
         testPublicKeyNear,
       );
 
       expect(result.isValid).toBe(false);
-      expect(result.error).toContain("Missing nonce");
+      expect(result.error).toContain("Not a NEAR NEP-413 signature");
     });
 
     it("rejects missing recipient", () => {
-      const userSignature = createTestUserSignature("test") as Partial<UserSignature>;
+      const userSignature = createTestUserSignature("test") as Partial<LegacyUserSignature>;
       delete userSignature.recipient;
 
       const result = validateIntentSignature(
-        userSignature as UserSignature,
+        userSignature as LegacyUserSignature,
         testPublicKeyNear,
       );
 
       expect(result.isValid).toBe(false);
-      expect(result.error).toContain("Missing recipient");
+      expect(result.error).toContain("Not a NEAR NEP-413 signature");
     });
 
     it("rejects mismatched public key", () => {

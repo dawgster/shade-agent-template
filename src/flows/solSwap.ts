@@ -38,7 +38,6 @@ export async function executeSolanaSwapFlow(
   // Sign with derivation path that includes userDestination for custody isolation
   const signature = await signWithNearChainSignatures(
     transaction.message.serialize(),
-    intent.nearPublicKey,
     intent.userDestination,
   );
   const finalized = attachSignatureToVersionedTx(transaction, signature);
@@ -59,7 +58,6 @@ async function buildJupiterSwapTransaction(
   // This ensures each user's funds flow through a unique derived account
   const agentPublicKey = await deriveAgentPublicKey(
     SOLANA_DEFAULT_PATH,
-    intent.nearPublicKey,
     intent.userDestination,
   );
 

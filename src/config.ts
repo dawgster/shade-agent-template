@@ -27,6 +27,7 @@ function parseNearRpcUrls(): string[] {
 
 export const config = {
   nearRpcUrls: parseNearRpcUrls(),
+  nearSeedPhrase: process.env.NEAR_SEED_PHRASE || "",
   redisUrl: process.env.REDIS_URL || "redis://127.0.0.1:6379",
   redisQueueKey: process.env.REDIS_QUEUE_KEY || "near:intents",
   redisVisibilityMs:

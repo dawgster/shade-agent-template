@@ -27,7 +27,6 @@ type QuoteRequestBody = QuoteRequest & {
   kaminoDeposit?: {
     marketAddress: string;
     mintAddress: string;
-    nearPublicKey: string;
   };
 };
 
@@ -154,13 +153,22 @@ app.post("/quote", async (c) => {
   if (userDestination) {
     const agentPubkey = await deriveAgentPublicKey(
       undefined,
-      payload.kaminoDeposit?.nearPublicKey,
       userDestination,
     );
     agentSolanaAddress = agentPubkey.toBase58();
   }
 
-  // Two-leg swap: First swap origin asset to SOL via Intents, then SOL to final token via Jupiter
+  if (config.intentsQuoteUrl) {
+    OpenAPI.BASE = config.intentsQuoteUrl;
+  }
+
+  // For Kamino deposits, use direct swap to target token (no Jupiter leg needed)
+  // Intents delivers the target SPL token directly, then we deposit to Kamino
+  if (kaminoDeposit) {
+    return handleKaminoDepositQuote(c, payload, defuseQuoteFields, isDryRun, agentSolanaAddress, kaminoDeposit, sourceChain, userDestination, metadata);
+  }
+
+  // Regular two-leg swap: First swap origin asset to SOL via Intents, then SOL to final token via Jupiter
   // Use Defuse asset ID format for the SOL destination
   const solDefuseAssetId = getSolDefuseAssetId();
   const solQuoteRequest = {
@@ -173,10 +181,6 @@ app.post("/quote", async (c) => {
       recipientType: "DESTINATION_CHAIN" as const,
     }),
   };
-
-  if (config.intentsQuoteUrl) {
-    OpenAPI.BASE = config.intentsQuoteUrl;
-  }
 
   console.info("[intents/quote] requesting SOL leg quote", {
     originAsset: payload.originAsset,
@@ -191,7 +195,7 @@ app.post("/quote", async (c) => {
   let intentsQuote: IntentsQuoteResponse;
   try {
     intentsQuote = (await OneClickService.getQuote(
-      solQuoteRequest,
+      solQuoteRequest as any,
     )) as IntentsQuoteResponse;
   } catch (err) {
     console.error("[intents/quote] intents quote failed", err);
@@ -269,19 +273,6 @@ app.post("/quote", async (c) => {
       // This ensures the same address is used for delivery and signing
       const agentDestination = agentSolanaAddress!;
 
-      // Build metadata - include Kamino-specific fields if present
-      let intentMetadata = payload.metadata || {};
-      if (payload.kaminoDeposit) {
-        intentMetadata = {
-          ...intentMetadata,
-          action: "kamino-deposit",
-          marketAddress: payload.kaminoDeposit.marketAddress,
-          mintAddress: payload.kaminoDeposit.mintAddress,
-          targetDefuseAssetId: payload.destinationAsset,
-          useIntents: true,
-        };
-      }
-
       const intentMessage: IntentMessage = {
         intentId: quoteId,
         sourceChain: payload.sourceChain,
@@ -295,8 +286,7 @@ app.post("/quote", async (c) => {
         agentDestination,
         intentsDepositAddress: baseQuote.depositAddress,
         depositMemo: baseQuote.depositMemo,
-        nearPublicKey: payload.kaminoDeposit?.nearPublicKey,
-        metadata: intentMetadata,
+        metadata: payload.metadata,
       };
 
       const validatedIntent = validateIntent(intentMessage);
@@ -307,7 +297,6 @@ app.post("/quote", async (c) => {
         intentId: quoteId,
         sourceChain: payload.sourceChain,
         depositAddress: baseQuote.depositAddress,
-        isKaminoDeposit: !!payload.kaminoDeposit,
       });
     } catch (err) {
       console.error("[intents/quote] Failed to auto-enqueue intent", err);
@@ -335,5 +324,147 @@ app.post("/quote", async (c) => {
     },
   });
 });
+
+/**
+ * Handle Kamino deposit quote requests.
+ * For Kamino deposits, we swap directly to the target SPL token via Intents (no Jupiter leg).
+ * The flow is: Source asset -> Target SPL token (via Intents) -> Kamino deposit
+ */
+async function handleKaminoDepositQuote(
+  c: any,
+  payload: QuoteRequestBody,
+  defuseQuoteFields: Omit<QuoteRequestBody, "sourceChain" | "userDestination" | "metadata" | "kaminoDeposit">,
+  isDryRun: boolean,
+  agentSolanaAddress: string | undefined,
+  kaminoDeposit: { marketAddress: string; mintAddress: string },
+  sourceChain: IntentChain | undefined,
+  userDestination: string | undefined,
+  metadata: Record<string, unknown> | undefined,
+) {
+  // For Kamino deposits, swap directly to the destination asset (the SPL token to deposit)
+  const directQuoteRequest = {
+    ...defuseQuoteFields,
+    dry: isDryRun,
+    // Set recipient to the derived agent address so Intents delivers tokens there
+    ...(agentSolanaAddress && {
+      recipient: agentSolanaAddress,
+      recipientType: "DESTINATION_CHAIN" as const,
+    }),
+  };
+
+  console.info("[intents/quote] Kamino deposit: requesting direct quote", {
+    originAsset: payload.originAsset,
+    destinationAsset: payload.destinationAsset,
+    amount: payload.amount,
+    slippageTolerance: payload.slippageTolerance,
+    dry: isDryRun,
+    intentsQuoteUrl: OpenAPI.BASE,
+    agentRecipient: agentSolanaAddress,
+    kaminoMarket: kaminoDeposit.marketAddress,
+    kaminoMint: kaminoDeposit.mintAddress,
+  });
+
+  let intentsQuote: IntentsQuoteResponse;
+  try {
+    intentsQuote = (await OneClickService.getQuote(
+      directQuoteRequest as any,
+    )) as IntentsQuoteResponse;
+  } catch (err) {
+    console.error("[intents/quote] Kamino deposit: intents quote failed", err);
+    return c.json({ error: (err as Error).message }, 502);
+  }
+
+  const baseQuote = intentsQuote.quote || {};
+  const rawAmountOut =
+    baseQuote.amountOut ||
+    baseQuote.minAmountOut ||
+    baseQuote.amount;
+  if (!rawAmountOut) {
+    return c.json({ error: "Intents quote missing amountOut" }, 502);
+  }
+
+  // Ensure amount is a clean integer string
+  let amountOut: string;
+  try {
+    amountOut = BigInt(rawAmountOut).toString();
+  } catch (e) {
+    console.error("[intents/quote] Failed to parse amountOut as integer", { rawAmountOut });
+    return c.json({ error: `Invalid amount format from intents: ${rawAmountOut}` }, 502);
+  }
+
+  // Generate a quote ID for tracking
+  const quoteId = baseQuote.quoteId || `shade-kamino-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+  // When dry: false, auto-enqueue the Kamino deposit intent
+  if (!isDryRun && config.enableQueue && baseQuote.depositAddress) {
+    if (!sourceChain) {
+      return c.json({ error: "sourceChain is required when dry: false" }, 400);
+    }
+    if (!userDestination) {
+      return c.json({ error: "userDestination is required when dry: false" }, 400);
+    }
+
+    try {
+      const agentDestination = agentSolanaAddress!;
+
+      // Build Kamino-specific metadata
+      const intentMetadata = {
+        ...metadata,
+        action: "kamino-deposit",
+        marketAddress: kaminoDeposit.marketAddress,
+        mintAddress: kaminoDeposit.mintAddress,
+        targetDefuseAssetId: payload.destinationAsset,
+        useIntents: true,
+      };
+
+      const intentMessage: IntentMessage = {
+        intentId: quoteId,
+        sourceChain,
+        sourceAsset: payload.originAsset,
+        sourceAmount: payload.amount,
+        destinationChain: "solana",
+        intermediateAmount: amountOut,
+        finalAsset: payload.destinationAsset,
+        slippageBps: payload.slippageTolerance,
+        userDestination,
+        agentDestination,
+        intentsDepositAddress: baseQuote.depositAddress,
+        depositMemo: baseQuote.depositMemo,
+        metadata: intentMetadata,
+      };
+
+      const validatedIntent = validateIntent(intentMessage);
+      await queueClient.enqueueIntent(validatedIntent);
+      await setStatus(validatedIntent.intentId, { state: "pending" });
+
+      console.info("[intents/quote] Kamino deposit intent auto-enqueued", {
+        intentId: quoteId,
+        sourceChain,
+        depositAddress: baseQuote.depositAddress,
+        kaminoMarket: kaminoDeposit.marketAddress,
+      });
+    } catch (err) {
+      console.error("[intents/quote] Failed to auto-enqueue Kamino intent", err);
+    }
+  }
+
+  return c.json({
+    timestamp: intentsQuote.timestamp || new Date().toISOString(),
+    signature: intentsQuote.signature || "",
+    quoteRequest: {
+      ...payload,
+      dry: isDryRun,
+    },
+    quote: {
+      ...baseQuote,
+      quoteId,
+      amountOut,
+      minAmountOut: amountOut,
+      destinationAsset: payload.destinationAsset,
+      depositAddress: baseQuote.depositAddress,
+      depositMemo: baseQuote.depositMemo,
+    },
+  });
+}
 
 export default app;

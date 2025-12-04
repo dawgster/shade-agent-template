@@ -9,24 +9,11 @@ import {
   validateIntentSignature,
 } from "../utils/nearSignature";
 import {
-  serializeTransaction,
-  getAccessKeyInfo,
-  broadcastTransaction,
-  createSignedTransaction,
-  NearAction,
-} from "../utils/nearTransaction";
-import {
-  deriveNearImplicitAccount,
-  NEAR_DEFAULT_PATH,
-} from "../utils/chainSignature";
-import { requestSignature } from "@neardefi/shade-agent-js";
-import { utils } from "chainsig.js";
-
-const { uint8ArrayToHex } = utils.cryptography;
-
-// Gas amounts
-const GAS_FOR_EXECUTE = "100000000000000"; // 100 TGas
-const ZERO_DEPOSIT = "0";
+  executeMetaTransaction,
+  createFunctionCallAction,
+  GAS_FOR_FT_TRANSFER_CALL,
+  ZERO_DEPOSIT,
+} from "../utils/nearMetaTx";
 
 interface BurrowWithdrawResult {
   txId: string;
@@ -79,14 +66,9 @@ export async function executeBurrowWithdrawFlow(
     return result;
   }
 
-  // Derive the NEAR implicit account from the user's public key
-  // This ensures the user retains ownership of their assets
-  const { accountId: nearAccountId, publicKey: derivedPublicKey } = await deriveNearImplicitAccount(
-    NEAR_DEFAULT_PATH,
-    intent.nearPublicKey,
-  );
-
-  console.log(`[burrowWithdraw] Using derived NEAR account: ${nearAccountId}`);
+  if (!intent.userDestination) {
+    throw new Error("Burrow withdraw requires userDestination for custody isolation");
+  }
 
   // Verify the token can be withdrawn
   const assets = await getAssetsPagedDetailed();
@@ -110,45 +92,20 @@ export async function executeBurrowWithdrawFlow(
 
   console.log(`[burrowWithdraw] Built withdraw tx via Rhea SDK: ${withdrawTx.method_name} on ${withdrawTx.contract_id}`);
 
-  const txActions: NearAction[] = [
-    {
-      type: "FunctionCall",
-      methodName: withdrawTx.method_name,
-      args: JSON.stringify(withdrawTx.args),
-      gas: GAS_FOR_EXECUTE,
-      deposit: ZERO_DEPOSIT,
-    },
-  ];
+  // Create action for meta transaction
+  const action = createFunctionCallAction(
+    withdrawTx.method_name,
+    withdrawTx.args,
+    GAS_FOR_FT_TRANSFER_CALL,
+    ZERO_DEPOSIT,
+  );
 
-  // Get access key info for the derived account
-  const accessKeyInfo = await getAccessKeyInfo(nearAccountId, derivedPublicKey);
-
-  // Serialize transaction using derived account and public key
-  const serializedTx = serializeTransaction({
-    signerId: nearAccountId,
-    publicKey: derivedPublicKey,
-    nonce: accessKeyInfo.nonce + 1,
-    receiverId: withdrawTx.contract_id, // Burrow contract from SDK response
-    blockHash: accessKeyInfo.block_hash,
-    actions: txActions,
-  });
-
-  // Sign with chain signatures using the same derivation path
-  const derivationPath = `${NEAR_DEFAULT_PATH},${intent.nearPublicKey}`;
-  const signRes = await requestSignature({
-    path: derivationPath,
-    payload: uint8ArrayToHex(serializedTx),
-    keyType: "Eddsa",
-  });
-
-  if (!signRes.signature) {
-    throw new Error("Failed to get signature from chain signatures");
-  }
-
-  const signature = parseSignatureResponse(signRes.signature);
-  const signedTxBase64 = createSignedTransaction(serializedTx, signature);
-
-  const { txHash } = await broadcastTransaction(signedTxBase64);
+  // Execute via meta transaction - agent pays for gas
+  const txHash = await executeMetaTransaction(
+    intent.userDestination,
+    withdrawTx.contract_id,
+    [action],
+  );
 
   console.log(`[burrowWithdraw] Withdraw tx confirmed: ${txHash}`);
 
@@ -159,24 +116,4 @@ export async function executeBurrowWithdrawFlow(
   // 3. Return bridge tx hash
 
   return { txId: txHash };
-}
-
-function parseSignatureResponse(sigResponse: string | { r: string; s: string }): Uint8Array {
-  if (typeof sigResponse === "string") {
-    if (sigResponse.startsWith("0x")) {
-      return Buffer.from(sigResponse.slice(2), "hex");
-    }
-    try {
-      const hexBytes = Buffer.from(sigResponse, "hex");
-      if (hexBytes.length === 64) return hexBytes;
-    } catch {}
-    return Buffer.from(sigResponse, "base64");
-  }
-
-  const r = Buffer.from(sigResponse.r, "hex");
-  const s = Buffer.from(sigResponse.s, "hex");
-  const signature = new Uint8Array(64);
-  signature.set(r, 0);
-  signature.set(s, 32);
-  return signature;
 }

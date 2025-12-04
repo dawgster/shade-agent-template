@@ -96,7 +96,9 @@ export interface IntentMessage {
   userSignature?: UserSignature;
 }
 
-export interface UserSignature {
+/** NEAR NEP-413 signature */
+export interface NearUserSignature {
+  type: "near";
   /** The signed message (typically a hash of the intent payload) */
   message: string;
   /** The signature in base64 or hex format */
@@ -108,6 +110,33 @@ export interface UserSignature {
   /** The recipient used for NEP-413 signing */
   recipient: string;
 }
+
+/** Solana Ed25519 signature */
+export interface SolanaUserSignature {
+  type: "solana";
+  /** The signed message (typically a hash of the intent payload) */
+  message: string;
+  /** The signature in base58, base64, or hex format (64 bytes) */
+  signature: string;
+  /** The Solana public key that signed (base58 encoded) */
+  publicKey: string;
+}
+
+/** Legacy signature format (NEAR, for backwards compatibility) */
+export interface LegacyUserSignature {
+  /** The signed message (typically a hash of the intent payload) */
+  message: string;
+  /** The signature in base64 or hex format */
+  signature: string;
+  /** The NEAR public key that signed (e.g., "ed25519:ABC...") */
+  publicKey: string;
+  /** The nonce used for NEP-413 signing (base64-encoded 32 bytes) */
+  nonce: string;
+  /** The recipient used for NEP-413 signing */
+  recipient: string;
+}
+
+export type UserSignature = NearUserSignature | SolanaUserSignature | LegacyUserSignature;
 
 export interface ValidatedIntent extends IntentMessage {
   slippageBps: number;

@@ -22,6 +22,7 @@ import { config } from "../config";
 import { KaminoWithdrawMetadata, ValidatedIntent } from "../queue/types";
 import {
   attachSignatureToVersionedTx,
+  attachMultipleSignaturesToVersionedTx,
   broadcastSolanaTx,
   deriveAgentPublicKey,
   SOLANA_DEFAULT_PATH,
@@ -31,9 +32,9 @@ import {
   createDummySigner,
 } from "../utils/chainSignature";
 import {
-  createIntentSigningMessage,
-  validateIntentSignature,
-} from "../utils/nearSignature";
+  createSolanaIntentSigningMessage,
+  validateSolanaIntentSignature,
+} from "../utils/solanaSignature";
 import { SOL_NATIVE_MINT } from "../constants";
 import {
   OneClickService,
@@ -65,9 +66,9 @@ function createKaminoRpc() {
  * Throws an error if authorization fails
  */
 function verifyUserAuthorization(intent: ValidatedIntent): void {
-  // Require nearPublicKey for Kamino withdrawals
-  if (!intent.nearPublicKey) {
-    throw new Error("Kamino withdraw requires nearPublicKey to identify the user");
+  // Require userDestination for Kamino withdrawals
+  if (!intent.userDestination) {
+    throw new Error("Kamino withdraw requires userDestination to identify the user");
   }
 
   // Require user signature
@@ -75,13 +76,23 @@ function verifyUserAuthorization(intent: ValidatedIntent): void {
     throw new Error("Kamino withdraw requires userSignature for authorization");
   }
 
-  // Generate the expected message hash for this intent
-  const expectedMessage = createIntentSigningMessage(intent);
+  // Signature must be from Solana destination account
+  // Check if it's a NEAR signature (has nonce/recipient) - reject these
+  if ("nonce" in intent.userSignature || "recipient" in intent.userSignature) {
+    throw new Error("Kamino withdraw requires a Solana signature, not a NEAR signature");
+  }
 
-  // Validate the signature
-  const result = validateIntentSignature(
-    intent.userSignature,
-    intent.nearPublicKey,
+  // Generate the expected message hash for this intent
+  const expectedMessage = createSolanaIntentSigningMessage(intent);
+
+  // Validate the signature - must be signed by the userDestination address
+  const result = validateSolanaIntentSignature(
+    {
+      message: intent.userSignature.message,
+      signature: intent.userSignature.signature,
+      publicKey: intent.userSignature.publicKey,
+    },
+    intent.userDestination,
     expectedMessage,
   );
 
@@ -109,13 +120,28 @@ export async function executeKaminoWithdrawFlow(
 
   // Step 1: Execute Kamino withdrawal
   const { transaction, serializedMessage } = await buildKaminoWithdrawTransaction(intent);
-  // Sign with derivation path that includes userDestination for custody isolation
-  const signature = await signWithNearChainSignatures(
+
+  // Transaction requires two signatures:
+  // 1. Base agent (fee payer) - pays for gas, index 0
+  // 2. User-specific derived account (token owner) - holds kTokens, index 1
+
+  // Sign with base agent (fee payer)
+  const feePayerSignature = await signWithNearChainSignatures(
     serializedMessage,
-    intent.nearPublicKey,
+    undefined, // base agent path
+  );
+
+  // Sign with user-specific derived account (token owner)
+  const userAgentSignature = await signWithNearChainSignatures(
+    serializedMessage,
     intent.userDestination,
   );
-  const finalized = attachSignatureToVersionedTx(transaction, signature);
+
+  const finalized = attachMultipleSignaturesToVersionedTx(transaction, [
+    { signature: feePayerSignature, index: 0 },
+    { signature: userAgentSignature, index: 1 },
+  ]);
+
   const txId = await broadcastSolanaTx(finalized);
 
   console.log(`[kaminoWithdraw] Withdrawal tx confirmed: ${txId}`);
@@ -139,13 +165,15 @@ async function buildKaminoWithdrawTransaction(
   const rpc = createKaminoRpc();
   const meta = intent.metadata as KaminoWithdrawMetadata;
 
-  // Include userDestination in path for custody isolation
-  const agentPublicKey = await deriveAgentPublicKey(
+  // Base agent pays for transaction fees (has SOL)
+  const feePayerPublicKey = await deriveAgentPublicKey(SOLANA_DEFAULT_PATH);
+
+  // User-specific derived account holds kTokens for custody isolation
+  const userAgentPublicKey = await deriveAgentPublicKey(
     SOLANA_DEFAULT_PATH,
-    intent.nearPublicKey,
     intent.userDestination,
   );
-  const ownerAddress = address(agentPublicKey.toBase58());
+  const ownerAddress = address(userAgentPublicKey.toBase58());
 
   // Create a dummy signer - we only need its address, not actual signing capability
   // The actual signing is done via NEAR chain signatures
@@ -205,7 +233,7 @@ async function buildKaminoWithdrawTransaction(
   }));
 
   const messageV0 = new TransactionMessage({
-    payerKey: agentPublicKey,
+    payerKey: feePayerPublicKey, // Base agent pays for gas
     recentBlockhash: blockhash,
     instructions: web3Instructions,
   }).compileToV0Message();
@@ -292,10 +320,12 @@ async function executeBridgeBack(
   console.log(`[kaminoWithdraw] Got intents deposit address: ${depositAddress}`);
 
   // Step 2: Build transaction to send tokens to the deposit address
-  // Include userDestination in path for custody isolation
-  const agentPublicKey = await deriveAgentPublicKey(
+  // Base agent pays for transaction fees (has SOL)
+  const feePayerPublicKey = await deriveAgentPublicKey(SOLANA_DEFAULT_PATH);
+
+  // User-specific derived account holds tokens for custody isolation
+  const userAgentPublicKey = await deriveAgentPublicKey(
     SOLANA_DEFAULT_PATH,
-    intent.nearPublicKey,
     intent.userDestination,
   );
 
@@ -307,9 +337,9 @@ async function executeBridgeBack(
 
   // Check if this is native SOL or an SPL token
   if (mintAddress === SOL_NATIVE_MINT) {
-    // Native SOL transfer
+    // Native SOL transfer - user agent sends SOL
     transferIx = SystemProgram.transfer({
-      fromPubkey: agentPublicKey,
+      fromPubkey: userAgentPublicKey,
       toPubkey: depositPubkey,
       lamports: BigInt(withdrawnAmount),
     });
@@ -320,7 +350,7 @@ async function executeBridgeBack(
     // Get or create associated token accounts
     const sourceAta = await getAssociatedTokenAddress(
       mintPubkey,
-      agentPublicKey,
+      userAgentPublicKey,
     );
 
     const destinationAta = await getAssociatedTokenAddress(
@@ -334,11 +364,11 @@ async function executeBridgeBack(
 
     const instructions = [];
 
-    // Create destination ATA if it doesn't exist
+    // Create destination ATA if it doesn't exist (fee payer pays for this)
     if (!destinationAtaInfo) {
       instructions.push(
         createAssociatedTokenAccountInstruction(
-          agentPublicKey, // payer
+          feePayerPublicKey, // payer (base agent pays rent)
           destinationAta, // ata
           depositPubkey, // owner
           mintPubkey, // mint
@@ -346,32 +376,41 @@ async function executeBridgeBack(
       );
     }
 
-    // Add transfer instruction
+    // Add transfer instruction (user agent signs as token owner)
     instructions.push(
       createTransferInstruction(
         sourceAta,
         destinationAta,
-        agentPublicKey,
+        userAgentPublicKey,
         BigInt(withdrawnAmount),
       ),
     );
 
     // Build transaction with multiple instructions
     const messageV0 = new TransactionMessage({
-      payerKey: agentPublicKey,
+      payerKey: feePayerPublicKey, // Base agent pays for gas
       recentBlockhash: blockhash,
       instructions,
     }).compileToV0Message();
 
     const transaction = new VersionedTransaction(messageV0);
+    const serializedMessage = transaction.message.serialize();
 
-    // Sign and broadcast with userDestination in derivation path
-    const signature = await signWithNearChainSignatures(
-      transaction.message.serialize(),
-      intent.nearPublicKey,
+    // Sign with both accounts
+    const feePayerSignature = await signWithNearChainSignatures(
+      serializedMessage,
+      undefined,
+    );
+    const userAgentSignature = await signWithNearChainSignatures(
+      serializedMessage,
       intent.userDestination,
     );
-    const finalized = attachSignatureToVersionedTx(transaction, signature);
+
+    const finalized = attachMultipleSignaturesToVersionedTx(transaction, [
+      { signature: feePayerSignature, index: 0 },
+      { signature: userAgentSignature, index: 1 },
+    ]);
+
     const txId = await broadcastSolanaTx(finalized);
 
     console.log(`[kaminoWithdraw] Bridge transfer tx confirmed: ${txId}`);
@@ -381,20 +420,28 @@ async function executeBridgeBack(
 
   // For native SOL, build a simple transfer transaction
   const messageV0 = new TransactionMessage({
-    payerKey: agentPublicKey,
+    payerKey: feePayerPublicKey, // Base agent pays for gas
     recentBlockhash: blockhash,
     instructions: [transferIx],
   }).compileToV0Message();
 
   const transaction = new VersionedTransaction(messageV0);
+  const serializedMessage = transaction.message.serialize();
 
-  // Sign and broadcast with userDestination in derivation path
-  const signature = await signWithNearChainSignatures(
-    transaction.message.serialize(),
-    intent.nearPublicKey,
+  // Sign with both accounts
+  const feePayerSignature = await signWithNearChainSignatures(
+    serializedMessage,
+    undefined,
+  );
+  const userAgentSignature = await signWithNearChainSignatures(
+    serializedMessage,
     intent.userDestination,
   );
-  const finalized = attachSignatureToVersionedTx(transaction, signature);
+
+  const finalized = attachMultipleSignaturesToVersionedTx(transaction, [
+    { signature: feePayerSignature, index: 0 },
+    { signature: userAgentSignature, index: 1 },
+  ]);
   const txId = await broadcastSolanaTx(finalized);
 
   console.log(`[kaminoWithdraw] Bridge transfer tx confirmed: ${txId}`);

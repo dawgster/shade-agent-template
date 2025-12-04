@@ -1,7 +1,7 @@
 import nacl from "tweetnacl";
 import bs58 from "bs58";
 import crypto from "crypto";
-import { UserSignature } from "../queue/types";
+import { UserSignature, NearUserSignature, LegacyUserSignature } from "../queue/types";
 
 /**
  * NEP-413 Payload structure for message signing
@@ -138,6 +138,13 @@ function decodeSignature(signature: string): Uint8Array {
 }
 
 /**
+ * Type guard to check if a signature is a NEAR NEP-413 signature
+ */
+export function isNearSignature(sig: UserSignature): sig is NearUserSignature | LegacyUserSignature {
+  return "nonce" in sig && "recipient" in sig;
+}
+
+/**
  * Verifies a NEP-413 signature
  *
  * NEP-413 signing process:
@@ -152,6 +159,12 @@ function decodeSignature(signature: string): Uint8Array {
  */
 export function verifyNearSignature(userSignature: UserSignature): boolean {
   try {
+    // Check if this is a NEAR signature
+    if (!isNearSignature(userSignature)) {
+      console.error("Signature is not a NEAR NEP-413 signature (missing nonce/recipient)");
+      return false;
+    }
+
     // Decode the nonce from base64
     const nonceBytes = new Uint8Array(Buffer.from(userSignature.nonce, "base64"));
     if (nonceBytes.length !== 32) {
@@ -245,18 +258,11 @@ export function validateIntentSignature(
   expectedPublicKey: string,
   expectedMessage?: string,
 ): { isValid: boolean; error?: string } {
-  // Check required NEP-413 fields
-  if (!userSignature.nonce) {
+  // Check if this is a NEAR signature
+  if (!isNearSignature(userSignature)) {
     return {
       isValid: false,
-      error: "Missing nonce. NEP-413 signatures require a nonce.",
-    };
-  }
-
-  if (!userSignature.recipient) {
-    return {
-      isValid: false,
-      error: "Missing recipient. NEP-413 signatures require a recipient.",
+      error: "Not a NEAR NEP-413 signature. Missing nonce or recipient.",
     };
   }
 

@@ -25,18 +25,14 @@ export function getSolanaConnection() {
 
 export async function deriveAgentPublicKey(
   path = SOLANA_DEFAULT_PATH,
-  nearPublicKey?: string,
   userDestination?: string,
 ) {
   const accountId = config.shadeContractId;
   if (!accountId) throw new Error("NEXT_PUBLIC_contractId not configured");
 
-  // Build derivation path including user identifiers for custody isolation
-  // Each unique user gets their own derived agent account
+  // Build derivation path including user destination for custody isolation
+  // Each unique userDestination gets their own derived agent account
   let derivationPath = path;
-  if (nearPublicKey) {
-    derivationPath = `${derivationPath},${nearPublicKey}`;
-  }
   if (userDestination) {
     derivationPath = `${derivationPath},${userDestination}`;
   }
@@ -60,6 +56,29 @@ export function attachSignatureToVersionedTx(
   signatures[0] = signature;
   const signed = new VersionedTransaction(tx.message, signatures);
   return signed;
+}
+
+/**
+ * Attach multiple signatures to a versioned transaction at specified indices.
+ * Used when a transaction requires multiple signers (e.g., fee payer + token owner).
+ * @param tx - The transaction to sign
+ * @param signaturePairs - Array of {signature, index} pairs matching signer order in the message
+ */
+export function attachMultipleSignaturesToVersionedTx(
+  tx: VersionedTransaction,
+  signaturePairs: Array<{ signature: Uint8Array; index: number }>,
+): VersionedTransaction {
+  const signatures = tx.signatures.length
+    ? [...tx.signatures]
+    : Array(tx.message.header.numRequiredSignatures).fill(
+        new Uint8Array(64),
+      );
+
+  for (const { signature, index } of signaturePairs) {
+    signatures[index] = signature;
+  }
+
+  return new VersionedTransaction(tx.message, signatures);
 }
 
 export async function broadcastSolanaTx(tx: VersionedTransaction, skipConfirmation = false) {
